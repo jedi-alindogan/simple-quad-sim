@@ -133,7 +133,7 @@ class Robot:
         k_omega = 100.0
         omega_ref = - k_q * 2 * q_err[1:]
         alpha = - k_omega * (omega_b - omega_ref)
-        tau = self.J @ alpha
+        tau = self.J @ alpha + np.cross(omega_b, self.J @ omega_b)
         
         # Compute the motor speeds.
         B = np.array([
