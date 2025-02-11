@@ -73,7 +73,7 @@ class Robot:
         self.constant_thrust = 10e-4
         self.constant_drag = 10e-6
         self.omega_motors = np.array([0.0, 0.0, 0.0, 0.0])
-        self.state = self.reset_state_and_input(np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0, 0.0]))
+        self.state = self.reset_state_and_input(np.array([1.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0, 0.0]))
         self.time = 0.0
 
     def reset_state_and_input(self, init_xyz, init_quat_wxyz):
