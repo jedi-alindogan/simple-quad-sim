@@ -170,7 +170,7 @@ def control_propellers(quad):
     T = 1.5
     r = 2*np.pi * t / T
     prop_thrusts = quad.control(p_d_I = np.array([np.cos(r/2), np.sin(r), 0.0]))
-    # Note: for Hover mode, just replace the desired trajectory with [0, 0, 1]
+    # Note: for Hover mode, just replace the desired trajectory with [1, 0, 1]
     quad.update(prop_thrusts, dt)
 
 def main():
