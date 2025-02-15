@@ -3,6 +3,8 @@
 ### email: hbd730@gmail.com, anto.cuni@gmail.com
 
 from mpl_toolkits.mplot3d import Axes3D
+import matplotlib
+matplotlib.use('TkAgg')
 from matplotlib.colors import cnames
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
