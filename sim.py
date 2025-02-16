@@ -44,6 +44,7 @@ IDX_OMEGA_X = 10
 IDX_OMEGA_Y = 11
 IDX_OMEGA_Z = 12
 
+
 class Robot:
     
     '''
@@ -58,8 +59,10 @@ class Robot:
     inputs:
         omega_1, omega_2, omega_3, omega_4 - angular velocities of the motors
     '''
-    def __init__(self, recording=True):
+    def __init__(self, recording=True, vehicle='quadsim', trajectory='figure_eight', method='PID_control', condition='no_wind', count=0):
         self.recording = recording
+
+        # Parameters 
         self.m = 1.0 # mass of the robot
         self.arm_length = 0.25 # length of the quadcopter arm (motor to center)
         self.height = 0.05 # height of the quadcopter
@@ -69,7 +72,6 @@ class Robot:
                                     (0, -self.arm_length, 0, 1),
                                     (0, 0, 0, 1),
                                     (0, 0, self.height, 1)])
-
         self.J = 0.025 * np.eye(3) # [kg m^2]
         self.J_inv = np.linalg.inv(self.J)
         self.constant_thrust = 10e-4
@@ -77,30 +79,52 @@ class Robot:
         self.omega_motors = np.array([0.0, 0.0, 0.0, 0.0])
         self.state = self.reset_state_and_input(np.array([1.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0, 0.0]))
         self.time = 0.0
-
-        self.data_log = {field: [] for field in ['t', 'p', 'p_d', 'v', 'q', 'R', 'w', 'fa', 'pwm']}
-        self.data_log['vehicle'] = 'simulated_quadcopter'   # Example identifier
-        self.data_log['trajectory'] = 'figure_eight'          # Example trajectory
-        self.data_log['method'] = 'PID_control'             # Example control method
-        self.data_log['condition'] = 'no_wind'              # Example condition
         
+        # Data logging
+        self.data_log = {field: [] for field in ['t', 'p', 'p_d', 'v', 'q', 'R', 'w', 'fa', 'pwm']}
+        self.data_log['vehicle'] = vehicle
+        self.data_log['trajectory'] = trajectory
+        self.data_log['method'] = method
+        self.data_log['condition'] = condition
+        self.data_log['count'] = count
+
+        if condition == 'no_wind':
+            self.F0 = 0
+        else:
+            self.F0 = np.random.uniform(-5, 5)
+        self.wind_frequency = np.random.uniform(2 * np.pi / 15, 2 * np.pi / 5)
+        self.wind_phase = np.random.uniform(0, 2 * np.pi)
+        self.wind_direction = np.array([1/np.sqrt(2), 1/np.sqrt(2), 0])
+        self.fa = self.get_disturbance()
+        
+    def get_disturbance(self):
+        fa = self.F0 * np.sin(self.wind_frequency * self.time + self.wind_phase) * self.wind_direction
+        return fa
+    
     def record_data(self):
         """
         Records data from the simulation into a format used by the Neural Fly ML Model.
         """
-        q = self.state[IDX_QUAT_W:IDX_QUAT_Z+1]
-        R = scipy.spatial.transform.Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+        t = self.time
+        p = self.state[IDX_POS_X:IDX_POS_Z+1].copy()
+        p_d = self.p_d_I.copy()
+        v = self.state[IDX_VEL_X:IDX_VEL_Z+1].copy()
+        q = self.state[IDX_QUAT_W:IDX_QUAT_Z+1].copy()
+        R = scipy.spatial.transform.Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().tolist()
+        w = self.state[IDX_OMEGA_X:IDX_OMEGA_Z+1].copy()
+        fa = np.zeros(3)
+        pwm = self.omega_motors.copy()
 
-        self.data_log['t'].append(self.time)
-        self.data_log['p'].append(self.state[:3])
-        self.data_log['p_d'].append(self.p_d_I)             # Desired position placeholder
-        self.data_log['v'].append(self.state[3:6])
+        self.data_log['t'].append(t)
+        self.data_log['p'].append(p)
+        self.data_log['p_d'].append(p_d)             # Desired position placeholder
+        self.data_log['v'].append(v)
         self.data_log['q'].append(q)
-        self.data_log['R'].append(R.tolist())
-        self.data_log['w'].append(self.state[IDX_OMEGA_X:IDX_OMEGA_Z+1])
-        self.data_log['fa'].append(np.zeros(3))             # Placeholder aerodynamic force
-        self.data_log['pwm'].append(self.omega_motors)
-
+        self.data_log['R'].append(R)
+        self.data_log['w'].append(w)
+        self.data_log['fa'].append(fa)               # Placeholder aerodynamic force
+        self.data_log['pwm'].append(pwm)
+    
     def save_simulation_data(self, folder):
         # Convert time-series data to NumPy arrays
         data_dict = {key: np.array(self.data_log[key]) for key in self.data_log if isinstance(self.data_log[key], list)}
@@ -110,6 +134,7 @@ class Robot:
         data_dict['trajectory'] = str(self.data_log['trajectory'])
         data_dict['method'] = str(self.data_log['method'])
         data_dict['condition'] = str(self.data_log['condition'])
+        data_dict['count'] = str(self.data_log['count'])
 
         utils.save_data([data_dict], folder)
 
@@ -140,7 +165,8 @@ class Robot:
         tau_z = self.constant_drag * (omegas_motor[0]**2 - omegas_motor[1]**2 + omegas_motor[2]**2 - omegas_motor[3]**2)
         tau_b = np.array([tau_x, tau_y, tau_z])
 
-        v_dot = 1 / self.m * R @ f_b + np.array([0, 0, -9.81])
+        self.fa = self.get_disturbance()
+        v_dot = 1 / self.m * R @ f_b + np.array([0, 0, -9.81]) + self.fa / self.m
         omega_dot = self.J_inv @ (np.cross(self.J @ omega, omega) + tau_b)
         q_dot = 1 / 2 * quat_mult(q, [0, *omega])
         p_dot = v_I
@@ -158,7 +184,7 @@ class Robot:
         omega_b = self.state[IDX_OMEGA_X:IDX_OMEGA_Z+1]
 
         # Position controller. TODO: Change to Neural Network
-        k_p = 1.0
+        k_p = 1.
         k_d = 10.0
         v_r = - k_p * (p_I - p_d_I)
         a = -k_d * (v_I - v_r) + np.array([0, 0, 9.81])
@@ -189,7 +215,7 @@ class Robot:
         omega_motor = np.sqrt(np.clip(omega_motor_square, 0, None))
         return omega_motor
     
-DURATION = 50 
+DURATION = 10
 RECORDING = True
 PLAYBACK_SPEED = 1
 CONTROL_FREQUENCY = 200 # Hz for attitude control loop
@@ -209,18 +235,22 @@ def get_pos_full_quadcopter(quad):
     pos_full_quad = quadWorldFrame[0:3]
     return pos_full_quad
 
-def control_propellers(quad):
+def control_propellers(quad, trajectory='figure_eight', backward=False):
     t = quad.time
-    T = 1.5
+    T = 10
     r = 2*np.pi * t / T
-    prop_thrusts = quad.control(p_d_I = np.array([np.cos(r/2), np.sin(r), 0.0]))
-    # prop_thrusts = quad.control(p_d_I = np.array([1.0, 0 , 1.0]))
-    # prop_thrusts = np.array([0, 70, 0, 70])
-    # Note: for Hover mode, just replace the desired trajectory with [1, 0, 1]
+    b = -1 if backward else 1
+    if trajectory == 'figure_eight':
+        prop_thrusts = quad.control(p_d_I = b * np.array([np.cos(r/2), np.sin(r), np.sin(r/2)])) # Figure 8
+    elif trajectory == 'circle':
+        prop_thrusts = quad.control(p_d_I = b * np.array([np.cos(r), np.sin(r), np.sin(r/2)]))
+    else:
+        prop_thrusts = quad.control(p_d_I = np.array([1.0, 0 , 1.0]))   # Hover Mode
+
     quad.update(prop_thrusts, dt)
 
 def main():
-    quadcopter = Robot()
+    quadcopter = Robot(recording=RECORDING)
     if not RECORDING:
         def control_loop(i):
             for _ in range(PLAYBACK_SPEED):
@@ -236,7 +266,7 @@ def main():
         for _ in range(steps):
             control_propellers(quadcopter)
         
-        quadcopter.save_simulation_data('./simple-quad-sim/simulation_data/')
+        quadcopter.save_simulation_data('./hw2/simple-quad-sim/simulation_data/')
         print("Simulation complete. Data saved.")
 
 if __name__ == "__main__":

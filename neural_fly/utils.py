@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 folder = './data/experiment'
-filename_fields = ['vehicle', 'trajectory', 'method', 'condition']
+filename_fields = ['vehicle', 'trajectory', 'method', 'condition', 'count']
 
 def save_data(Data : List[dict], folder : str, fields=['t', 'p', 'p_d', 'v', 'q', 'R', 'w', 'fa', 'pwm']):
     ''' Save {Data} to individual csv files in {folder}, serializing (2+)d ndarrays as lists '''
