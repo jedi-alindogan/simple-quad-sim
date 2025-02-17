@@ -112,7 +112,7 @@ class Robot:
         q = self.state[IDX_QUAT_W:IDX_QUAT_Z+1].copy()
         R = scipy.spatial.transform.Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().tolist()
         w = self.state[IDX_OMEGA_X:IDX_OMEGA_Z+1].copy()
-        fa = np.zeros(3)
+        fa = self.fa.copy()
         pwm = self.omega_motors.copy()
 
         self.data_log['t'].append(t)
@@ -216,7 +216,6 @@ class Robot:
         return omega_motor
     
 DURATION = 10
-RECORDING = True
 PLAYBACK_SPEED = 1
 CONTROL_FREQUENCY = 200 # Hz for attitude control loop
 dt = 1.0 / CONTROL_FREQUENCY
@@ -235,39 +234,54 @@ def get_pos_full_quadcopter(quad):
     pos_full_quad = quadWorldFrame[0:3]
     return pos_full_quad
 
-def control_propellers(quad, trajectory='figure_eight', backward=False):
+def control_propellers(quad, trajectory='figure_eight', direction=1):
     t = quad.time
-    T = 10
+    T = 5
     r = 2*np.pi * t / T
-    b = -1 if backward else 1
     if trajectory == 'figure_eight':
-        prop_thrusts = quad.control(p_d_I = b * np.array([np.cos(r/2), np.sin(r), np.sin(r/2)])) # Figure 8
+        prop_thrusts = quad.control(p_d_I = direction * np.array([np.cos(r/2), np.sin(r), np.sin(r/2)])) # Figure 8
     elif trajectory == 'circle':
-        prop_thrusts = quad.control(p_d_I = b * np.array([np.cos(r), np.sin(r), np.sin(r/2)]))
+        prop_thrusts = quad.control(p_d_I = direction * np.array([np.cos(r), np.sin(r), np.sin(r/2)]))
     else:
         prop_thrusts = quad.control(p_d_I = np.array([1.0, 0 , 1.0]))   # Hover Mode
 
     quad.update(prop_thrusts, dt)
 
-def main():
-    quadcopter = Robot(recording=RECORDING)
-    if not RECORDING:
-        def control_loop(i):
-            for _ in range(PLAYBACK_SPEED):
-                control_propellers(quadcopter)
-            return get_pos_full_quadcopter(quadcopter)
-        plotter = QuadPlotter()
-        plotter.plot_animation(control_loop)
+def generate_dataset(folder, trajectory='figure_eight', condition='wind', count=0):
+    quadcopter = Robot(recording=True, condition=condition, count=count)
+    steps = int(DURATION / dt)
 
-    else:
-        simulation_duration = DURATION
-        steps = int(simulation_duration / dt)
+    # Generate a forward or backward trajectory
+    direction = np.random.choice([-1,1])
+    for _ in range(steps):
+        control_propellers(quadcopter, trajectory=trajectory, direction=direction)
+    quadcopter.save_simulation_data(folder)
 
-        for _ in range(steps):
+    print(f'Simulation {count} complete. Data saved.')
+
+def simulate():
+    quadcopter = Robot(recording=False)
+    def control_loop(i):
+        for _ in range(PLAYBACK_SPEED):
             control_propellers(quadcopter)
-        
-        quadcopter.save_simulation_data('./hw2/simple-quad-sim/simulation_data/')
-        print("Simulation complete. Data saved.")
+        return get_pos_full_quadcopter(quadcopter)
+    plotter = QuadPlotter()
+    plotter.plot_animation(control_loop)
+
+
+def main():
+
+    trajectories = ['figure_eight', 'circle', 'hover']
+
+    folder = './hw2/data/testing'
+    for n in range(10):
+        if n < len(trajectories):
+            trajectory = trajectories[n]
+            generate_dataset(folder, trajectory=trajectory, count=n)
+        else:
+            idx = np.random.choice([0,1,2])
+            trajectory = trajectories[idx]
+            generate_dataset(folder, trajectory=trajectory, count=n)
 
 if __name__ == "__main__":
     main()
