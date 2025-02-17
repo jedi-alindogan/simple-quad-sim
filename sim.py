@@ -59,7 +59,7 @@ class Robot:
     inputs:
         omega_1, omega_2, omega_3, omega_4 - angular velocities of the motors
     '''
-    def __init__(self, recording=True, vehicle='quadsim', trajectory='figure_eight', method='PID_control', condition='no_wind', count=0):
+    def __init__(self, recording=True, vehicle='quadsim', trajectory='figure8', method='PID', condition='nowind'):
         self.recording = recording
 
         # Parameters 
@@ -86,12 +86,11 @@ class Robot:
         self.data_log['trajectory'] = trajectory
         self.data_log['method'] = method
         self.data_log['condition'] = condition
-        self.data_log['count'] = count
 
         if condition == 'no_wind':
             self.F0 = 0
         else:
-            self.F0 = np.random.uniform(-5, 5)
+            self.F0 = float(condition)
         self.wind_frequency = np.random.uniform(2 * np.pi / 15, 2 * np.pi / 5)
         self.wind_phase = np.random.uniform(0, 2 * np.pi)
         self.wind_direction = np.array([1/np.sqrt(2), 1/np.sqrt(2), 0])
@@ -134,7 +133,6 @@ class Robot:
         data_dict['trajectory'] = str(self.data_log['trajectory'])
         data_dict['method'] = str(self.data_log['method'])
         data_dict['condition'] = str(self.data_log['condition'])
-        data_dict['count'] = str(self.data_log['count'])
 
         utils.save_data([data_dict], folder)
 
@@ -215,7 +213,7 @@ class Robot:
         omega_motor = np.sqrt(np.clip(omega_motor_square, 0, None))
         return omega_motor
     
-DURATION = 10
+DURATION = 20
 PLAYBACK_SPEED = 1
 CONTROL_FREQUENCY = 200 # Hz for attitude control loop
 dt = 1.0 / CONTROL_FREQUENCY
@@ -234,27 +232,29 @@ def get_pos_full_quadcopter(quad):
     pos_full_quad = quadWorldFrame[0:3]
     return pos_full_quad
 
-def control_propellers(quad, trajectory='figure_eight', direction=1):
+def control_propellers(quad, trajectory='figure8', scale=2):
     t = quad.time
     T = 5
     r = 2*np.pi * t / T
-    if trajectory == 'figure_eight':
-        prop_thrusts = quad.control(p_d_I = direction * np.array([np.cos(r/2), np.sin(r), np.sin(r/2)])) # Figure 8
+    if trajectory == 'figure8':
+        prop_thrusts = quad.control(p_d_I = scale * np.array([np.cos(r/2), np.sin(r), np.sin(r/2)/4])) # Figure 8
     elif trajectory == 'circle':
-        prop_thrusts = quad.control(p_d_I = direction * np.array([np.cos(r), np.sin(r), np.sin(r/2)]))
-    else:
+        prop_thrusts = quad.control(p_d_I = scale * np.array([np.cos(r), np.sin(r), np.sin(r/2)]))
+    elif trajectory =='hover':
         prop_thrusts = quad.control(p_d_I = np.array([1.0, 0 , 1.0]))   # Hover Mode
+    else:
+        print('trajectory not implemented')
 
     quad.update(prop_thrusts, dt)
 
-def generate_dataset(folder, trajectory='figure_eight', condition='wind', count=0):
-    quadcopter = Robot(recording=True, condition=condition, count=count)
+def generate_dataset(folder, trajectory='figure8', condition=0, count=0):
+    quadcopter = Robot(recording=True, condition=condition)
     steps = int(DURATION / dt)
 
     # Generate a forward or backward trajectory
-    direction = np.random.choice([-1,1])
+    scale = np.random.choice([-1.5,1.5])
     for _ in range(steps):
-        control_propellers(quadcopter, trajectory=trajectory, direction=direction)
+        control_propellers(quadcopter, trajectory=trajectory, scale=scale)
     quadcopter.save_simulation_data(folder)
 
     print(f'Simulation {count} complete. Data saved.')
@@ -268,20 +268,17 @@ def simulate():
     plotter = QuadPlotter()
     plotter.plot_animation(control_loop)
 
-
 def main():
-
-    trajectories = ['figure_eight', 'circle', 'hover']
+    folder = './hw2/data/training'
+    conditions = np.arange(0, 11, 1)
+    for (n, c) in enumerate(conditions):
+        generate_dataset(folder, trajectory='figure8', condition=c, count=n)
+        conditions = np.arange(0, 11, 1)
 
     folder = './hw2/data/testing'
-    for n in range(10):
-        if n < len(trajectories):
-            trajectory = trajectories[n]
-            generate_dataset(folder, trajectory=trajectory, count=n)
-        else:
-            idx = np.random.choice([0,1,2])
-            trajectory = trajectories[idx]
-            generate_dataset(folder, trajectory=trajectory, count=n)
+    conditions = np.arange(5,11,1)
+    for (n, c) in enumerate(conditions):
+        generate_dataset(folder, trajectory='circle', condition=c, count=n)
 
 if __name__ == "__main__":
     main()
