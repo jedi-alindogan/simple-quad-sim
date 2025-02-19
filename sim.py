@@ -2,6 +2,8 @@ import scipy.spatial.transform
 import numpy as np
 from animate_function import QuadPlotter
 from neural_fly import utils
+from neural_fly import mlmodel
+import torch
 
 def quat_mult(q, p):
     # q * p
@@ -59,7 +61,15 @@ class Robot:
     inputs:
         omega_1, omega_2, omega_3, omega_4 - angular velocities of the motors
     '''
-    def __init__(self, recording=True, vehicle='quadsim', trajectory='figure8', method='PID', condition='nowind'):
+    def __init__(self,
+                 recording=True, 
+                 vehicle='quadsim', 
+                 trajectory='figure8', 
+                 method='PID', 
+                 condition='nowind', 
+                 count=0,
+                 basis=None
+                 ):
         self.recording = recording
 
         # Parameters 
@@ -76,9 +86,30 @@ class Robot:
         self.J_inv = np.linalg.inv(self.J)
         self.constant_thrust = 10e-4
         self.constant_drag = 10e-6
-        self.omega_motors = np.array([0.0, 0.0, 0.0, 0.0])
-        self.state = self.reset_state_and_input(np.array([1.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0, 0.0]))
+        self.pwm = np.array([0.0, 0.0, 0.0, 0.0])
+        self.state = self.reset_state_and_input(np.array([2.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0, 0.0]))
         self.time = 0.0
+
+        # Disturbance
+        self.fa = np.zeros(3)
+
+        # Adaptation Model
+        self.basis = basis
+        if self.basis is not None:
+            self.Phi = self.compute_Phi()
+            self.ahat = np.zeros(9)  # dim_a * dim_u
+            self.s = np.zeros(3)
+
+            # Gain Matrices
+            self._lam = 1               # adaptation gain
+            self._Lam = np.eye(3)       # s gain matrix
+            self._Q   = 1e-4 * np.eye(9)       # not sure what this is ngl
+            self._P   = 0 * np.eye(9)       # covariance-like matrix
+            self._K   = np.eye(3)       # tracking error gain
+            self._R   = np.eye(3)       # also not sure what this is
+            
+            # Simulate measurement noise of the force
+            self.measurement_cov = np.eye(3) * (self.m * 0.001) ** 2
         
         # Data logging
         self.data_log = {field: [] for field in ['t', 'p', 'p_d', 'v', 'q', 'R', 'w', 'fa', 'pwm']}
@@ -86,19 +117,7 @@ class Robot:
         self.data_log['trajectory'] = trajectory
         self.data_log['method'] = method
         self.data_log['condition'] = condition
-
-        if condition == 'no_wind':
-            self.F0 = 0
-        else:
-            self.F0 = float(condition)
-        self.wind_frequency = np.random.uniform(2 * np.pi / 15, 2 * np.pi / 5)
-        self.wind_phase = np.random.uniform(0, 2 * np.pi)
-        self.wind_direction = np.array([1/np.sqrt(2), 1/np.sqrt(2), 0])
-        self.fa = self.get_disturbance()
-        
-    def get_disturbance(self):
-        fa = self.F0 * np.sin(self.wind_frequency * self.time + self.wind_phase) * self.wind_direction
-        return fa
+        self.data_log['count'] = count
     
     def record_data(self):
         """
@@ -112,7 +131,7 @@ class Robot:
         R = scipy.spatial.transform.Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().tolist()
         w = self.state[IDX_OMEGA_X:IDX_OMEGA_Z+1].copy()
         fa = self.fa.copy()
-        pwm = self.omega_motors.copy()
+        pwm = self.pwm.copy()
 
         self.data_log['t'].append(t)
         self.data_log['p'].append(p)
@@ -133,6 +152,7 @@ class Robot:
         data_dict['trajectory'] = str(self.data_log['trajectory'])
         data_dict['method'] = str(self.data_log['method'])
         data_dict['condition'] = str(self.data_log['condition'])
+        data_dict['count'] = str(self.data_log['count'])
 
         utils.save_data([data_dict], folder)
 
@@ -146,6 +166,7 @@ class Robot:
 
     def update(self, omegas_motor, dt):
         # Record the current data
+        self.pwm = omegas_motor
         if self.recording:
             self.record_data()
 
@@ -163,7 +184,6 @@ class Robot:
         tau_z = self.constant_drag * (omegas_motor[0]**2 - omegas_motor[1]**2 + omegas_motor[2]**2 - omegas_motor[3]**2)
         tau_b = np.array([tau_x, tau_y, tau_z])
 
-        self.fa = self.get_disturbance()
         v_dot = 1 / self.m * R @ f_b + np.array([0, 0, -9.81]) + self.fa / self.m
         omega_dot = self.J_inv @ (np.cross(self.J @ omega, omega) + tau_b)
         q_dot = 1 / 2 * quat_mult(q, [0, *omega])
@@ -172,21 +192,61 @@ class Robot:
         x_dot = np.concatenate([p_dot, v_dot, q_dot, omega_dot])
         self.state += x_dot * dt
         self.state[IDX_QUAT_W:IDX_QUAT_Z+1] /= np.linalg.norm(self.state[IDX_QUAT_W:IDX_QUAT_Z+1]) # Re-normalize quaternion.
+
+        # Composite Adaptation Updates
+        if self.basis is not None:
+            # Measure the residual force
+            noise = np.random.multivariate_normal(mean=np.zeros(3), cov=self.measurement_cov)
+            y = self.fa + noise # Intoducing noise so it's like a sensor.
+
+            # Compute derivatives
+            _Rinv = np.linalg.inv(self._R)
+            ahat_dot = - self._lam * self.ahat \
+                - self._P @ (self.Phi).T @ _Rinv @ (self.Phi @ self.ahat - y) \
+                + self._P @ (self.Phi).T @ self.s
+            _P_dot = - 2 * self._lam * self._P \
+                + self._Q - self._P @ (self.Phi).T @ _Rinv @ self.Phi @ self._P
+            
+            # Update
+            self.ahat += ahat_dot * dt
+            self._P += _P_dot * dt
+
         self.time += dt
 
-    def control(self, p_d_I):
+    def compute_Phi(self):
+        v_I = self.state[IDX_VEL_X:IDX_VEL_Z+1]
+        q = self.state[IDX_QUAT_W:IDX_QUAT_Z+1]
+        x = np.hstack((v_I, q, self.pwm))
+        x_tensor = torch.from_numpy(x).to(torch.double)
+        phi = self.basis(x_tensor).detach().numpy()
+        zero = np.zeros_like(phi)
+        Phi = np.hstack(
+                (np.vstack((phi, zero, zero)), 
+                 np.vstack((zero, phi, zero)), 
+                 np.vstack((zero, zero, phi))))
+        return Phi
+
+    def control(self, p_d_I, v_d_I = np.zeros(3), a_d_I = np.zeros(3)):
         self.p_d_I = p_d_I
         p_I = self.state[IDX_POS_X:IDX_POS_Z+1]
         v_I = self.state[IDX_VEL_X:IDX_VEL_Z+1]
         q = self.state[IDX_QUAT_W:IDX_QUAT_Z+1]
         omega_b = self.state[IDX_OMEGA_X:IDX_OMEGA_Z+1]
 
-        # Position controller. TODO: Change to Neural Network
-        k_p = 1.
-        k_d = 10.0
-        v_r = - k_p * (p_I - p_d_I)
-        a = -k_d * (v_I - v_r) + np.array([0, 0, 9.81])
-        f = self.m * a
+        if self.basis is not None:
+            # Use composite adaptation
+            self.Phi = self.compute_Phi()
+            self.s = v_I - v_d_I - self._Lam @ (p_d_I - p_I)
+            a_r = a_d_I + self._Lam @ (v_d_I - v_I)
+            f = self.m * a_r + self.m * np.array([0, 0, 9.81]) - self._K @ self.s - self.Phi @ self.ahat
+        else:
+            # Use PD control
+            k_p = 1.
+            k_d = 10.0
+            v_r = - k_p * (p_I - p_d_I)
+            a = -k_d * (v_I - v_r) + np.array([0, 0, 9.81])
+            f = self.m * a
+        
         f_b = scipy.spatial.transform.Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().T @ f
         thrust = np.max([0, f_b[2]])
         
@@ -214,7 +274,7 @@ class Robot:
         return omega_motor
     
 DURATION = 20
-PLAYBACK_SPEED = 1
+PLAYBACK_SPEED = 3
 CONTROL_FREQUENCY = 200 # Hz for attitude control loop
 dt = 1.0 / CONTROL_FREQUENCY
 time = [0.0]
@@ -234,33 +294,86 @@ def get_pos_full_quadcopter(quad):
 
 def control_propellers(quad, trajectory='figure8', scale=2):
     t = quad.time
-    T = 5
+    T = 2.5
     r = 2*np.pi * t / T
+    rdot = 2 * np.pi / T
     if trajectory == 'figure8':
-        prop_thrusts = quad.control(p_d_I = scale * np.array([np.cos(r/2), np.sin(r), np.sin(r/2)/4])) # Figure 8
-    elif trajectory == 'circle':
-        prop_thrusts = quad.control(p_d_I = scale * np.array([np.cos(r), np.sin(r), np.sin(r/2)]))
-    elif trajectory =='hover':
-        prop_thrusts = quad.control(p_d_I = np.array([1.0, 0 , 1.0]))   # Hover Mode
-    else:
-        print('trajectory not implemented')
+        p_d_I = np.array([
+            scale * np.cos(r/2), 
+            scale * np.sin(r), 
+            np.sin(r/2)
+        ])
+        
+        v_d_I = np.array([
+            scale * (-0.5) * np.sin(r/2) * rdot,
+            scale * np.cos(r) * rdot,
+            0.5 * np.cos(r/2) * rdot
+        ])
+        
+        a_d_I = np.array([
+            scale * (-0.25) * np.cos(r/2) * rdot**2,
+            scale * -np.sin(r) * rdot**2,
+            -0.25 * np.sin(r/2) * rdot**2
+        ])
 
+    elif trajectory == 'circle':
+        p_d_I = np.array([
+            scale * np.cos(r), 
+            scale * np.sin(r), 
+            np.sin(r/2)
+        ])
+
+        v_d_I = np.array([
+            scale * -np.sin(r) * rdot,
+            scale * np.cos(r) * rdot,
+            0.5 * np.cos(r/2) * rdot
+        ])
+        
+        a_d_I = np.array([
+            scale * -np.cos(r) * rdot**2,
+            scale * -np.sin(r) * rdot**2,
+            -0.25 * np.sin(r/2) * rdot**2
+        ])
+        prop_thrusts = quad.control(p_d_I = np.array([scale * np.cos(r), scale * np.sin(r), np.sin(r/2)]))
+
+    elif trajectory =='hover':
+        p_d_I = np.array([2, 0, 0])
+        v_d_I = np.zeros(3)
+        a_d_I = np.zeros(3)
+        prop_thrusts = quad.control(p_d_I)   # Hover Mode
+
+    else:
+        raise(ValueError, 'Trajectory not implemented.')
+    
+    prop_thrusts = quad.control(p_d_I, v_d_I, a_d_I)
     quad.update(prop_thrusts, dt)
 
-def generate_dataset(folder, trajectory='figure8', condition=0, count=0):
-    quadcopter = Robot(recording=True, condition=condition)
+def update_disturbance(quad, F0, alpha, beta):
+    direction = np.array([np.cos(alpha) * np.sin(beta),
+                          np.sin(alpha) * np.sin(beta),
+                          np.cos(beta)])
+    t = quad.time
+    T = 10
+    r = np.pi * t / T
+    fa = (F0 * np.sin(r)**2) * direction
+    noise = np.random.uniform(-1/30, 1/30)
+    quad.fa = fa + noise
+
+def generate_dataset(folder, trajectory='figure8', count=0, F0=0, alpha=0, beta=np.pi/2):
+    quadcopter = Robot(recording=True, trajectory=trajectory, condition=F0, count=count)
     steps = int(DURATION / dt)
 
     # Generate a forward or backward trajectory
-    scale = np.random.choice([-1.5,1.5])
+    scale = np.random.choice([-2,2])
     for _ in range(steps):
-        control_propellers(quadcopter, trajectory=trajectory, scale=scale)
+        update_disturbance(quadcopter, F0, alpha, beta)
+        control_propellers(quadcopter, trajectory, scale)
     quadcopter.save_simulation_data(folder)
 
     print(f'Simulation {count} complete. Data saved.')
 
-def simulate():
-    quadcopter = Robot(recording=False)
+def simulate(basis=None):
+    quadcopter = Robot(recording=False, basis=basis)
     def control_loop(i):
         for _ in range(PLAYBACK_SPEED):
             control_propellers(quadcopter)
@@ -268,17 +381,55 @@ def simulate():
     plotter = QuadPlotter()
     plotter.plot_animation(control_loop)
 
-def main():
-    folder = './hw2/data/training'
-    conditions = np.arange(0, 11, 1)
-    for (n, c) in enumerate(conditions):
-        generate_dataset(folder, trajectory='figure8', condition=c, count=n)
-        conditions = np.arange(0, 11, 1)
+def generate_all_data():
+    # Training sets
+    folder = './data/training'
+    F0s = [4, 8, 12, 16]
+    alphas = [0, np.pi/8, np.pi/4, 3*np.pi/8, np.pi/2]
+    betas = [5 * np.pi/12, 7 * np.pi/12]
+    combinations = [(f, a, b) for f in F0s for a in alphas for b in betas]
+    combinations.append((0,0,0))
 
-    folder = './hw2/data/testing'
-    conditions = np.arange(5,11,1)
-    for (n, c) in enumerate(conditions):
-        generate_dataset(folder, trajectory='circle', condition=c, count=n)
+    for (count, combo) in enumerate(combinations):
+        F0 = combo[0]
+        alpha = combo[1]
+        beta = combo[2]
+        p = np.random.uniform(0,1)
+        if p >= 0 and p < 0.4:
+            generate_dataset(folder,'figure8', count, F0, alpha, beta)
+        if p >= 0.4 and p < 0.8:
+            generate_dataset(folder,'circle', count, F0, alpha, beta)
+        if p >= 0.8:
+            generate_dataset(folder,'hover', count, F0, alpha, beta)
+
+
+    # Test sets
+    folder = './data/testing'
+    for count in range(10):
+        F0 = np.random.choice([5,6,7,8,9,10,11,12,13,14,15,16], replace=False)
+        alpha = np.random.uniform(0, np.pi/2)
+        beta = np.random.uniform(5 * np.pi/12, 7 * np.pi/12)
+        p = np.random.uniform(0,1)
+        if p >= 0 and p < 0.4:
+            generate_dataset(folder,'figure8', count, F0, alpha, beta)
+        if p >= 0.4 and p < 0.8:
+            generate_dataset(folder,'circle', count, F0, alpha, beta)
+        if p >= 0.8:
+            generate_dataset(folder,'hover', count, F0, alpha, beta)
+
+def main():
+    generate_all_data()
+        # dim_a = 3
+        # features = ['v', 'q', 'pwm']
+        # dataset = 'neural-fly'
+        # modelname = f"{dataset}_dim-a-{dim_a}_{'-'.join(features)}"
+
+        # stopping_epoch = 200
+        # folder = './hw2/simple-quad-sim/neural_fly/models/'
+        # model = mlmodel.load_model(modelname = modelname + '-epoch-' + str(stopping_epoch), modelfolder=folder)
+        # model.options['num_epochs'] = 200
+        # basis = model.phi
+        # simulate(basis=basis)
 
 if __name__ == "__main__":
     main()
