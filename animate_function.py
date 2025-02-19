@@ -19,7 +19,7 @@ class QuadPlotter(object):
         ax.plot([], [], [], '-', c='cyan')[0]
         ax.plot([], [], [], '-', c='red')[0]
         ax.plot([], [], [], '-', c='blue', marker='o', markevery=2)[0]
-        self.set_limit((-1.0, 1.0), (-1.0, 1.0), (-1.0, 5))
+        self.set_limit((-2.0, 2.0), (-2.0, 2.0), (-2.0, 5))
 
     def set_limit(self, x, y, z):
         ax = plt.gca()
